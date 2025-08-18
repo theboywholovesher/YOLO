@@ -1,0 +1,14 @@
+# YOLO检测项目依赖包
+ultralytics>=8.0.0
+opencv-python>=4.5.0
+Pillow>=8.0.0
+numpy>=1.20.0
+mss>=6.0.0
+requests>=2.25.0
+tqdm>=4.60.0
+
+# GUI相关
+tkinter  # 通常随Python安装，无需pip安装
+
+# 可选：用于更好的进度条显示
+tqdm>=4.60.0
