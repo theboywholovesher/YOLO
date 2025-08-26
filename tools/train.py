@@ -4,15 +4,26 @@ import threading
 from ultralytics import YOLO
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
                              QWidget, QPushButton, QLabel, QLineEdit, QFileDialog,
-                             QTextEdit, QSpinBox,QMessageBox)
+                             QTextEdit, QSpinBox, QMessageBox, QGroupBox, QCheckBox,
+                             QListWidget)
 from PyQt5.QtCore import Qt
+import torch
+from torch import nn
 
-
+def fix_param_size(param):
+    """将参数统一为二元元组 (h, w)"""
+    if isinstance(param, int):
+        return (param, param)  # 整数 → 二元元组
+    elif len(param) >= 2:
+        return tuple(param[:2])  # 截取前两个维度
+    else:
+        return (1, 1)  # 默认值
 class YOLOv8TrainGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("YOLOv8 训练工具 (PyQt5 GUI)")
-        self.setGeometry(100, 100, 800, 700)
+        self.setGeometry(100, 100, 800, 800)
+        self.original_class_names = []
 
         # 主窗口部件
         self.main_widget = QWidget()
@@ -34,6 +45,38 @@ class YOLOv8TrainGUI(QMainWindow):
         model_layout.addWidget(self.model_path)
         model_layout.addWidget(self.btn_browse_model)
         self.layout.addLayout(model_layout)
+
+        # --- 模型类别信息展示 ---
+        self.model_info_group = QGroupBox("模型类别信息")
+        self.model_info_layout = QVBoxLayout()
+        self.class_list_widget = QListWidget()
+        self.class_list_widget.setMaximumHeight(100)
+        self.model_info_layout.addWidget(QLabel("当前模型包含的类别:"))
+        self.model_info_layout.addWidget(self.class_list_widget)
+        self.model_info_group.setLayout(self.model_info_layout)
+        self.layout.addWidget(self.model_info_group)
+
+        # --- 新标签训练选项 ---
+        self.add_label_group = QGroupBox("新标签训练选项")
+        self.label_layout = QVBoxLayout()
+
+        self.new_label_checkbox = QCheckBox("添加新标签")
+        self.new_label_checkbox.stateChanged.connect(self.toggle_label_options)
+        self.label_layout.addWidget(self.new_label_checkbox)
+
+        # 新标签输入区域（默认隐藏）
+        self.label_input_layout = QHBoxLayout()
+        self.new_label_input = QLineEdit()
+        self.new_label_input.setPlaceholderText("输入新标签名称，多个用逗号分隔")
+        self.label_input_layout.addWidget(QLabel("新标签:"))
+        self.label_input_layout.addWidget(self.new_label_input)
+        self.label_input_widget = QWidget()
+        self.label_input_widget.setLayout(self.label_input_layout)
+        self.label_input_widget.setVisible(False)
+        self.label_layout.addWidget(self.label_input_widget)
+
+        self.add_label_group.setLayout(self.label_layout)
+        self.layout.addWidget(self.add_label_group)
 
         # --- 训练参数 ---
         self.add_section_title("3. 训练参数设置")
@@ -108,6 +151,26 @@ class YOLOv8TrainGUI(QMainWindow):
         )
         if file_path:
             self.model_path.setText(file_path)
+            # 加载模型并提取类别信息
+            try:
+                model = YOLO(file_path)
+                self.original_class_names = list(model.names.values()) if hasattr(model, 'names') else []
+                self.update_class_list()
+            except Exception as e:
+                self.log(f"❌ 加载模型失败: {str(e)}")
+
+    def update_class_list(self):
+        """更新类别列表显示"""
+        self.class_list_widget.clear()
+        if self.original_class_names:
+            for i, name in enumerate(self.original_class_names):
+                self.class_list_widget.addItem(f"{i}: {name}")
+        else:
+            self.class_list_widget.addItem("⚠️ 未检测到类别信息")
+
+    def toggle_label_options(self, state):
+        """切换新标签输入框的可见性"""
+        self.label_input_widget.setVisible(state == Qt.Checked)
 
     def log(self, message):
         self.log_output.append(message)
@@ -115,7 +178,7 @@ class YOLOv8TrainGUI(QMainWindow):
         QApplication.processEvents()  # 实时刷新界面
 
     def start_training(self):
-        # --- 检查输入 ---
+        # 检查输入
         train_img = self.train_img_path.text().strip()
         train_label = self.train_label_path.text().strip()
         model_pt = self.model_path.text().strip()
@@ -134,66 +197,159 @@ class YOLOv8TrainGUI(QMainWindow):
             QMessageBox.warning(self, "文件错误", f"预训练模型文件不存在：{model_pt}")
             return
 
-        # --- 参数 ---
+        # 参数
         epochs = self.epochs.value()
         batch = self.batch_size.value()
         imgsz = self.imgsz.value()
 
-        # --- 在后台线程中训练 ---
+        # 后台线程中训练
         self.btn_train.setEnabled(False)
         self.log("🔥 开始训练 YOLOv8 模型...")
-        thread = threading.Thread(target=self.run_training, args=(train_img, train_label, model_pt, epochs, batch, imgsz))
+        thread = threading.Thread(
+            target=self.run_training,
+            args=(train_img, train_label, model_pt, epochs, batch, imgsz)
+        )
         thread.start()
 
     def run_training(self, train_img, train_label, model_pt, epochs, batch, imgsz):
         try:
-            # --- 构造 data 配置（仅训练集，无验证集）---
+            # 获取新标签信息
+            add_new_labels = self.new_label_checkbox.isChecked()
+            new_labels = [label.strip() for label in self.new_label_input.text().split(',')
+                          if label.strip()] if add_new_labels else []
+
+            # 构建类别配置
+            if add_new_labels and new_labels:
+                nc = len(self.original_class_names) + len(new_labels)
+                names_list = self.original_class_names + new_labels
+            else:
+                nc = len(self.original_class_names)
+                names_list = self.original_class_names
+
+            # 验证新标签
+            if add_new_labels and not new_labels:
+                self.log("⚠️ 已启用新标签训练但未输入有效标签，使用标准训练模式")
+                add_new_labels = False
+
+            # 构建YAML配置
             data_yaml_content = f"""
             train: {os.path.abspath(train_img)}
-            val: {os.path.abspath(train_label)}
+            val: {os.path.abspath(train_img)}  # 简化验证集使用训练集
 
-            nc: 1  # 假设只有一个类别，根据你的实际类别数修改
-            names: ['object']  # 类别名称，可修改
+            nc: {nc}
+            names: {names_list}
             """
             data_path = "data_temp.yaml"
             with open(data_path, "w", encoding="utf-8") as f:
                 f.write(data_yaml_content)
 
-            # --- 加载模型并训练 ---
+            # 训练模式选择
+            model = YOLO(model_pt)
+            if add_new_labels and new_labels:
+                self.log("🔧 使用迁移学习模式训练新标签...")
+                model = YOLO(model_pt)
+
+                # 获取所有检测层（YOLOv8有3个尺度）
+                detect_layers = [m for m in model.model.modules() if hasattr(m, 'nc')]
+
+                if not detect_layers:
+                    raise Exception("未找到检测层，请检查模型结构")
+
+                # === 关键修复：重建输出层 ===
+                num_anchors = 3  # YOLOv8默认每层3个anchor[4](@ref)
+                for detect_layer in detect_layers:
+                    # 更新类别数
+                    old_nc = detect_layer.nc
+                    detect_layer.nc = nc
+
+                    # 定位输出卷积层
+                    output_conv = None
+                    for name, module in detect_layer.named_modules():
+                        if isinstance(module, nn.Conv2d) and module.out_channels == (old_nc + 5) * num_anchors:
+                            output_conv = module
+                            break
+
+                    if output_conv:
+                        # 计算新输出通道
+                        new_out_channels = (nc + 5) * num_anchors
+
+                        output_conv.kernel_size = fix_param_size(output_conv.kernel_size)
+                        output_conv.stride = fix_param_size(output_conv.stride)
+                        # 创建新卷积层（保持其他参数不变）
+                        new_conv = nn.Conv2d(
+                            in_channels=output_conv.in_channels,
+                            out_channels=new_out_channels,
+                            kernel_size=output_conv.kernel_size,
+                            stride=output_conv.stride,
+                            padding=output_conv.padding,
+                            bias=True
+                        )
+
+                        # 迁移权重（保留可用部分）
+                        with torch.no_grad():
+                            # 复制可匹配的权重
+                            min_channels = min(output_conv.out_channels, new_out_channels)
+                            new_conv.weight[:min_channels] = output_conv.weight[:min_channels]
+
+                            # 迁移bias（保留坐标和原始类别参数）
+                            if output_conv.bias is not None:
+                                new_bias = torch.zeros(new_out_channels)
+                                min_bias = min(output_conv.bias。shape[0], new_out_channels)
+                                new_bias[:min_bias] = output_conv.bias[:min_bias]
+                                new_conv.bias = nn.Parameter(new_bias)
+
+                        # 替换原始卷积层
+                        detect_layer.conv = new_conv
+
+                # === 冻结骨干网络 ===
+                for name, param in model.model.named_parameters():
+                    if "model." in name and int(name.split(".")[1]) < 15:
+                        param.requires_grad = False
+            else:
+                self.log("🔧 使用标准训练模式...")
+
+            # 训练日志
             self.log(f"📂 训练图片: {train_img}")
             self.log(f"📂 训练标签: {train_label}")
             self.log(f"🤖 预训练模型: {model_pt}")
+            self.log(f"🏷️ 类别配置: {len(names_list)}类 ({', '.join(names_list)})")
             self.log(f"⚙️  训练参数: epochs={epochs}, batch={batch}, imgsz={imgsz}")
 
-            model = YOLO(model_pt)  # 加载预训练模型
+            # 开始训练
             results = model.train(
                 data=data_path,
                 epochs=epochs,
                 batch=batch,
                 imgsz=imgsz,
-                name="exp",  # 实验名称
+                name="exp",
                 verbose=False
             )
 
-            # --- 训练完成 ---
+            # 训练完成处理
             best_pt = "runs/train/exp/weights/best.pt"
             if os.path.isfile(best_pt):
-                self.result_label.setText(f"✅ 训练完成！\n🎯 最佳模型已保存到：\n{best_pt}\n\n🔧 这是一个标准的 .pt 格式 YOLOv8 模型，可直接用于推理。")
+                result_msg = f"✅ 训练完成!\n🎯 最佳模型已保存到:\n{best_pt}"
+                if add_new_labels:
+                    result_msg += f"\n\n✨ 新增标签: {', '.join(new_labels)}"
+                self.result_label.setText(result_msg)
                 self.log(f"💾 模型已保存至: {best_pt}")
             else:
-                self.result_label.setText("⚠️ 训练完成，但未找到保存的模型文件，请检查日志。")
+                self.result_label。setText("⚠️ 训练完成，但未找到保存的模型文件，请检查日志。")
 
         except Exception as e:
             self.log(f"❌ 训练出错: {str(e)}")
             QMessageBox.critical(self, "训练错误", f"训练过程中发生异常：{str(e)}")
         finally:
-            self.btn_train.setEnabled(True)
-            # 清理临时 YAML（可选）
+            self.btn_train。setEnabled(True)
             if os.path.exists("data_temp.yaml"):
                 os.remove("data_temp.yaml")
 
+
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = YOLOv8TrainGUI()
-    window.show()
-    sys.exit(app.exec_())
+    try:
+        app = QApplication(sys.argv)
+        window = YOLOv8TrainGUI()
+        window.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        print(f"数组越界: {e}")
